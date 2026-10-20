@@ -13,12 +13,28 @@ struct TreeMapRect {
     var rect: CGRect
     let color: Color
     let depth: Int  // Nesting depth for cushion shading
+    /// A subdivided directory, drawn under its children so that gaps between
+    /// tiny children show the directory color, not the background
+    var isContainer = false
 }
 
 enum TreeMapLayout {
 
     /// Minimum aspect ratio for rectangles (prevents very thin rectangles)
     private static let minProportion: Double = 0.4
+
+    /// A directory smaller than this (in points, either side) is drawn as one block
+    private static let minDirectorySide: CGFloat = 6
+
+    /// Kind of the largest file in a directory: follows the largest child down.
+    /// Children are sorted by size, so this is O(depth).
+    static func dominantKindName(of node: FileNode) -> String {
+        var current = node
+        while current.isDirectory, let largest = current.children.first(where: { $0.size > 0 }) {
+            current = largest
+        }
+        return current.kindName
+    }
 
     /// Calculates treemap layout for the given node and its children
     static func layout(
@@ -53,7 +69,7 @@ enum TreeMapLayout {
                 results.append(TreeMapRect(
                     node: node,
                     rect: rect,
-                    color: colorProvider(node.kindName),
+                    color: colorProvider(dominantKindName(of: node)),
                     depth: depth
                 ))
             }
@@ -63,6 +79,13 @@ enum TreeMapLayout {
 
         guard totalWeight > 0 else { return results }
         directoryRects[ObjectIdentifier(node)] = rect
+        results.append(TreeMapRect(
+            node: node,
+            rect: rect,
+            color: colorProvider(dominantKindName(of: node)),
+            depth: depth,
+            isContainer: true
+        ))
 
         // Determine if rows should be horizontal or vertical
         let horizontal = rect.width >= rect.height
@@ -136,7 +159,8 @@ enum TreeMapLayout {
                 // Skip very small rectangles
                 if childRect.width >= 1 && childRect.height >= 1 {
                     // Recursively layout children if this is a directory
-                    if child.node.isDirectory && !child.node.children.isEmpty {
+                    let isLargeEnough = childRect.width >= minDirectorySide && childRect.height >= minDirectorySide
+                    if child.node.isDirectory && !child.node.children.isEmpty && isLargeEnough {
                         let childRects = layout(
                             node: child.node,
                             rect: childRect,
@@ -150,7 +174,7 @@ enum TreeMapLayout {
                         results.append(TreeMapRect(
                             node: child.node,
                             rect: childRect,
-                            color: colorProvider(child.node.kindName),
+                            color: colorProvider(dominantKindName(of: child.node)),
                             depth: depth + 1
                         ))
                     }

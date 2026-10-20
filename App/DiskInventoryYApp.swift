@@ -17,6 +17,7 @@ struct DiskInventoryYApp: App {
             ContentView()
                 .environmentObject(appState)
         }
+        .defaultSize(width: 1400, height: 900)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open Folder...") {

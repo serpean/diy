@@ -42,7 +42,8 @@ struct TreeMapView: View {
                 directoryRects: &directories
             )
             directoryRects = directories
-            leafRects = Dictionary(rects.map { (ObjectIdentifier($0.node), $0.rect) }, uniquingKeysWith: { first, _ in first })
+            leafRects = Dictionary(rects.lazy.filter { !$0.isContainer }.map { (ObjectIdentifier($0.node), $0.rect) },
+                                   uniquingKeysWith: { first, _ in first })
 
             cachedSize = size
             cachedRootId = rootId
@@ -160,7 +161,7 @@ struct TreeMapView: View {
 
 // MARK: - Base Layer
 
-/// Cushions and labels of all rects. Equatable on the layout version,
+/// Cushions, outlines and labels of all rects. Equatable on the layout version,
 /// so SwiftUI skips it when only the hover or the selection changes.
 private struct TreeMapBaseLayer: View, Equatable {
     let rects: [TreeMapRect]
@@ -170,11 +171,41 @@ private struct TreeMapBaseLayer: View, Equatable {
         lhs.layoutVersion == rhs.layoutVersion
     }
 
+    /// Outlines are drawn only around rects at least this large (points, both sides)
+    private static let minOutlinedFileSide: CGFloat = 4
+    private static let minOutlinedFolderSide: CGFloat = 12
+
     var body: some View {
         Canvas { context, _ in
-            // Draw all rectangles with cushion shading
+            // 1. Fills: directories first (rects are in pre-order), then files on top
             for rect in rects {
-                drawCushion(rect, context: context)
+                if rect.isContainer {
+                    // Gaps between tiny children show a darker tone of the directory content
+                    context.fill(Path(rect.rect), with: .color(adjustedColors(for: rect.color).dark))
+                } else {
+                    drawCushion(rect, context: context)
+                }
+            }
+
+            // 2. Outlines: one path for files, one for folders, so blocks of the same color stay apart
+            var fileOutlines = Path()
+            var folderOutlines = Path()
+            for rect in rects {
+                let r = rect.rect
+                if rect.isContainer {
+                    if rect.depth > 0 && min(r.width, r.height) >= Self.minOutlinedFolderSide {
+                        folderOutlines.addRect(r)
+                    }
+                } else if min(r.width, r.height) >= Self.minOutlinedFileSide {
+                    fileOutlines.addRect(r.insetBy(dx: 0.25, dy: 0.25))
+                }
+            }
+            context.stroke(fileOutlines, with: .color(.black.opacity(0.22)), lineWidth: 0.5)
+            context.stroke(folderOutlines, with: .color(.black.opacity(0.45)), lineWidth: 1)
+
+            // 3. Labels last, so no outline crosses them
+            for rect in rects where !rect.isContainer && rect.rect.width > 30 && rect.rect.height > 14 {
+                drawLabel(rect.node.name, in: rect.rect, context: context)
             }
         }
     }
@@ -185,87 +216,44 @@ private struct TreeMapBaseLayer: View, Equatable {
         let rect = treeRect.rect
         guard rect.width >= 1, rect.height >= 1 else { return }
 
-        let baseColor = treeRect.color
-
-        // Create cushion shading using radial gradient
-        // Light source is at top-left (-1, -1, 10)
-        let cushionPath = Path(rect)
-
         // Cushion effect: brighter at top-left, darker at bottom-right
         // Use cached color pairs to avoid repeated NSColor allocations
-        let (brightColor, darkColor) = adjustedColors(for: baseColor)
-
-        let gradient = Gradient(colors: [brightColor, darkColor])
+        let (brightColor, darkColor) = adjustedColors(for: treeRect.color)
 
         context.fill(
-            cushionPath,
+            Path(rect),
             with: .linearGradient(
-                gradient,
+                Gradient(colors: [brightColor, darkColor]),
                 startPoint: CGPoint(x: rect.minX, y: rect.minY),
                 endPoint: CGPoint(x: rect.maxX, y: rect.maxY)
             )
         )
-
-        // Label if rect is large enough (diagonal text fits in smaller rects)
-        if rect.width > 30 && rect.height > 16 {
-            drawLabel(treeRect.node.name, in: rect, context: context)
-        }
     }
 
+    /// Draws the name horizontally, only when it fits. Other names show in the info bar on hover.
     private func drawLabel(_ text: String, in rect: CGRect, context: GraphicsContext) {
-        // Font size based on smaller dimension
-        let fontSize = min(11, min(rect.height, rect.width) * 0.35)
-        guard fontSize >= 7 else { return }
-
-        let styledText = Text(text)
-            .font(.system(size: fontSize, weight: .medium))
-            .foregroundColor(.white.opacity(0.9))
-
-        // Measure the text to see if it fits horizontally
-        let resolvedText = context.resolve(styledText)
-        let textSize = resolvedText.measure(in: CGSize(width: .max, height: .max))
-
-        let paddingX: CGFloat = 6
+        let paddingX: CGFloat = 5
         let paddingY: CGFloat = 3
-        let availableWidth = rect.width - (paddingX * 2)
+        let fontSize = min(11, rect.height * 0.6)
+        guard fontSize >= 8 else { return }
 
-        // Check if text fits horizontally
-        let fitsHorizontally = textSize.width <= availableWidth
+        let resolvedText = context.resolve(
+            Text(text)
+                .font(.system(size: fontSize, weight: .medium))
+                .foregroundColor(.white)
+        )
+        let textSize = resolvedText.measure(in: CGSize(width: .max, height: .max))
+        guard textSize.width <= rect.width - paddingX * 2,
+              textSize.height <= rect.height - paddingY else { return }
 
-        // Create a clipped context so text doesn't overflow
-        var clippedContext = context
-        clippedContext.clip(to: Path(rect))
-
-        if fitsHorizontally {
-            // Draw horizontally, centered vertically, left-aligned
-            let startX = rect.minX + paddingX
-            let startY = rect.maxY - paddingY
-
-            clippedContext.draw(
-                resolvedText,
-                at: CGPoint(x: startX, y: startY),
-                anchor: .bottomLeading
-            )
-        } else {
-            // Calculate the actual diagonal angle from bottom-left to top-right
-            let diagonalAngle = atan2(rect.height, rect.width)
-            let angleInDegrees = diagonalAngle * 180 / .pi
-
-            // Position at bottom-left with padding
-            let startX = rect.minX + paddingX
-            let startY = rect.maxY - paddingY
-
-            // Rotate by the actual diagonal angle (negative = counter-clockwise)
-            clippedContext.translateBy(x: startX, y: startY)
-            clippedContext.rotate(by: .degrees(-angleInDegrees))
-
-            // Draw the text along the diagonal
-            clippedContext.draw(
-                resolvedText,
-                at: CGPoint(x: 0, y: 0),
-                anchor: .bottomLeading
-            )
-        }
+        // Dark shadow keeps white text readable on light colors (yellow, lime)
+        var labelContext = context
+        labelContext.addFilter(.shadow(color: .black.opacity(0.6), radius: 1.5, x: 0, y: 0.5))
+        labelContext.draw(
+            resolvedText,
+            at: CGPoint(x: rect.minX + paddingX, y: rect.maxY - paddingY),
+            anchor: .bottomLeading
+        )
     }
 
     // Pre-resolved color cache to avoid NSColor allocations during drawing
@@ -301,10 +289,10 @@ private struct TreeMapBaseLayer: View, Equatable {
         // This can happen with certain color space conversions
         let safeBrightness = max(0.5, brightness)
 
-        // Cushion gradient: bright top-left to slightly darker bottom-right
-        // Keep minimum brightness high to avoid dark/black boxes
-        let brightVal = min(1.0, safeBrightness * 1.2)
-        let darkVal = max(0.55, safeBrightness * 0.95)
+        // Cushion gradient: bright top-left to darker bottom-right.
+        // A stronger contrast than before separates neighbors of the same color.
+        let brightVal = min(1.0, safeBrightness * 1.15)
+        let darkVal = max(0.45, safeBrightness * 0.78)
 
         // Boost saturation for more vibrant colors
         let boostedSat = min(1.0, saturation * 1.2)

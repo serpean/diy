@@ -15,11 +15,11 @@ struct ContentView: View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             // Sidebar: File kind statistics
             SidebarView()
-                .navigationSplitViewColumnWidth(min: 200, ideal: 250, max: 350)
+                .navigationSplitViewColumnWidth(min: 170, ideal: 210, max: 300)
         } content: {
             // File list
             FileListView()
-                .navigationSplitViewColumnWidth(min: 250, ideal: 300, max: 500)
+                .navigationSplitViewColumnWidth(min: 280, ideal: 340, max: 560)
         } detail: {
             // TreeMap
             TreeMapContainerView()

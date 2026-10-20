@@ -98,33 +98,25 @@ struct FileRow: View {
     @EnvironmentObject private var appState: AppState
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
             // Icon
             Image(nsImage: node.icon)
                 .resizable()
                 .frame(width: 16, height: 16)
 
-            // Name
+            // Name: the last thing to be truncated. The kind is in the info bar.
             Text(node.name)
                 .lineLimit(1)
                 .truncationMode(.middle)
-
-            Spacer()
-
-            // Kind (for non-folders)
-            if !node.isDirectory {
-                Text(node.kindName)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-            }
+                .layoutPriority(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
             // Size
             Text(FileSizeFormatter.string(from: node.size))
                 .font(.caption)
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
-                .frame(width: 70, alignment: .trailing)
+                .frame(width: 64, alignment: .trailing)
 
             // Size bar
             SizeBar(
@@ -132,9 +124,10 @@ struct FileRow: View {
                 maxSize: appState.displayRoot?.size ?? node.size,
                 color: appState.color(for: node.kindName)
             )
-            .frame(width: 60)
+            .frame(width: 24)
         }
         .padding(.vertical, 2)
+        .help(node.path)
         .contextMenu {
             Button("Show in Finder") {
                 NSWorkspace.shared.selectFile(node.url.path, inFileViewerRootedAtPath: "")
