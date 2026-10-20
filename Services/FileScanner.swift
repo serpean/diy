@@ -17,6 +17,10 @@ private final class ScanContext: @unchecked Sendable {
     let showPackageContents: Bool
     let usePhysicalSize: Bool
     let maxConcurrentDirectories: Int
+    /// When the scan root is a volume, do not descend into other volumes mounted inside it
+    /// (e.g. /System/Volumes/Data under /, which repeats /Users), as `du -x` does.
+    /// Set once in scanRoot, before any concurrent work starts.
+    var stayOnVolume = false
     private let progress: @Sendable (String, Int, Int) -> Void
 
     private struct Counts {
@@ -58,6 +62,7 @@ private struct DirectoryEntry {
     let name: String
     let isDirectory: Bool
     let hasBundleBit: Bool
+    let isMountPoint: Bool
     let logicalSize: UInt64
     let allocatedSize: UInt64
 }
@@ -102,7 +107,8 @@ actor FileScanner {
         .fileSizeKey,
         .totalFileAllocatedSizeKey,
         .isSymbolicLinkKey,
-        .isAliasFileKey
+        .isAliasFileKey,
+        .isVolumeKey
     ]
 
     private static func scanRoot(url: URL, context: ScanContext) async throws -> FileNode {
@@ -126,6 +132,7 @@ actor FileScanner {
         // Don't follow symlinks or aliases to avoid infinite loops
         let shouldDescend = isDirectory && !(values.isSymbolicLink ?? false) && !(values.isAliasFile ?? false)
         if shouldDescend && (context.showPackageContents || !isPackage) {
+            context.stayOnVolume = values.isVolume ?? false
             try await scanContents(of: node, context: context)
         }
         return node
@@ -152,7 +159,8 @@ actor FileScanner {
                 let child = FileNode(path: path, isDirectory: true, isPackage: isPackage, size: 0)
                 child.parent = node
                 children.append(child)
-                if context.showPackageContents || !isPackage {
+                let isOtherVolume = context.stayOnVolume && entry.isMountPoint
+                if (context.showPackageContents || !isPackage) && !isOtherVolume {
                     subdirectories.append(child)
                 }
             } else {
@@ -232,6 +240,7 @@ actor FileScanner {
         request.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
         request.commonattr = attrgroup_t(ATTR_CMN_RETURNED_ATTRS) | attrgroup_t(ATTR_CMN_NAME)
             | attrgroup_t(ATTR_CMN_ERROR) | attrgroup_t(ATTR_CMN_OBJTYPE) | attrgroup_t(ATTR_CMN_FNDRINFO)
+        request.dirattr = attrgroup_t(ATTR_DIR_MOUNTSTATUS)
         request.fileattr = attrgroup_t(ATTR_FILE_ALLOCSIZE) | attrgroup_t(ATTR_FILE_DATALENGTH)
 
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: readBufferSize, alignment: 8)
@@ -285,6 +294,14 @@ actor FileScanner {
                     field += 32
                 }
 
+                // Directory attributes come before file attributes
+                var isMountPoint = false
+                if returned.dirattr & attrgroup_t(ATTR_DIR_MOUNTSTATUS) != 0 {
+                    let mountStatus = field.loadUnaligned(as: UInt32.self)
+                    isMountPoint = mountStatus & UInt32(DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0
+                    field += MemoryLayout<UInt32>.size
+                }
+
                 var allocatedSize: UInt64 = 0
                 var logicalSize: UInt64 = 0
                 if returned.fileattr & attrgroup_t(ATTR_FILE_ALLOCSIZE) != 0 {
@@ -300,6 +317,7 @@ actor FileScanner {
                     name: name,
                     isDirectory: isDirectory,
                     hasBundleBit: hasBundleBit,
+                    isMountPoint: isMountPoint,
                     logicalSize: logicalSize,
                     allocatedSize: allocatedSize
                 ))
