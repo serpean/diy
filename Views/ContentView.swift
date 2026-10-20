@@ -155,6 +155,7 @@ struct TreeMapContainerView: View {
             if let root = appState.displayRoot {
                 TreeMapView(
                     root: root,
+                    treeVersion: appState.treeVersion,
                     selectedNode: $appState.selectedNode,
                     colorProvider: { appState.color(for: $0) }
                 )

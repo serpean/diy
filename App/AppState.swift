@@ -22,6 +22,8 @@ class AppState: ObservableObject {
     @Published var errorMessage: String?
 
     @Published var kindStatistics: [FileKindStatistic] = []
+    /// Increases when the tree changes in place, so views can lay it out again
+    @Published private(set) var treeVersion = 0
     @Published var selectedKind: String?
 
     // MARK: - Settings
@@ -93,39 +95,28 @@ class AppState: ObservableObject {
                 }
             }
 
-            rootNode = root
-
             // Add free space and other space items if scanning a volume root
             if showFreeSpace || showOtherSpace {
-                await addVolumeSpaceItems(for: url)
+                addVolumeSpaceItems(to: root, for: url)
             }
+
+            // Statistics first: they assign the kind colors in a fixed order (by size)
+            // before the treemap asks for any color
+            await updateStatistics(for: root)
+            // A newer scan started while statistics were calculated: drop this result
+            guard scanner === newScanner else { return }
+            rootNode = root
 
         } catch is CancellationError {
             // Scan was cancelled, ignore
         } catch {
+            guard scanner === newScanner else { return }
             errorMessage = error.localizedDescription
         }
 
+        guard scanner === newScanner else { return }
         isScanning = false
         scanProgress = nil
-
-        // Calculate statistics in background (kindName triggers lazy UTType computation)
-        // Don't await - let sidebar populate asynchronously
-        if let root = rootNode {
-            Task.detached { [weak self] in
-                let stats = Self.collectStatistics(from: root)
-                await MainActor.run {
-                    self?.kindStatistics = stats.map { kind, stat in
-                        FileKindStatistic(
-                            kindName: kind,
-                            count: stat.count,
-                            totalSize: stat.size,
-                            color: self?.colorAssigner.color(for: kind) ?? .gray
-                        )
-                    }.sorted { $0.totalSize > $1.totalSize }
-                }
-            }
-        }
     }
 
     func refresh() async {
@@ -186,52 +177,63 @@ class AppState: ObservableObject {
 
         // Update statistics in background
         if let root = rootNode {
-            Task.detached { [weak self] in
-                let stats = Self.collectStatistics(from: root)
-                await MainActor.run {
-                    self?.kindStatistics = stats.map { kind, stat in
-                        FileKindStatistic(
-                            kindName: kind,
-                            count: stat.count,
-                            totalSize: stat.size,
-                            color: self?.colorAssigner.color(for: kind) ?? .gray
-                        )
-                    }.sorted { $0.totalSize > $1.totalSize }
-                }
-            }
+            Task { await updateStatistics(for: root) }
         }
 
-        // Trigger UI refresh
-        objectWillChange.send()
+        // Trigger UI refresh and a new treemap layout
+        treeVersion += 1
     }
 
     // MARK: - Private Methods
 
-    /// Collect statistics off-main-thread (kindName triggers lazy UTType computation)
+    /// Collects statistics off the main thread, then publishes them sorted by size.
+    /// Colors are assigned in that sorted order, so they do not depend on timing
+    /// or on dictionary order.
+    private func updateStatistics(for root: FileNode) async {
+        let sorted = await Task.detached {
+            Self.collectStatistics(from: root)
+                .map { (kind: $0.key, count: $0.value.count, size: $0.value.size) }
+                .sorted { $0.size != $1.size ? $0.size > $1.size : $0.kind < $1.kind }
+        }.value
+        kindStatistics = sorted.map { stat in
+            FileKindStatistic(
+                kindName: stat.kind,
+                count: stat.count,
+                totalSize: stat.size,
+                color: colorAssigner.color(for: stat.kind)
+            )
+        }
+    }
+
+    /// Collect statistics off-main-thread. Counts by kindId in arrays, then maps ids to names once.
     private nonisolated static func collectStatistics(from root: FileNode) -> [String: (count: Int, size: UInt64)] {
-        var stats: [String: (count: Int, size: UInt64)] = [:]
+        let registry = FileKindRegistry.shared
+        var counts = [Int](repeating: 0, count: registry.count)
+        var sizes = [UInt64](repeating: 0, count: registry.count)
 
-        func collect(_ node: FileNode) {
+        // Iterative walk: deep trees cannot overflow the stack
+        var stack: [FileNode] = [root]
+        while let node = stack.popLast() {
             if !node.isDirectory {
-                let kind = node.kindName
-                var stat = stats[kind] ?? (count: 0, size: 0)
-                stat.count += 1
-                stat.size += node.size
-                stats[kind] = stat
+                let id = Int(node.kindId)
+                if id >= counts.count {
+                    counts.append(contentsOf: repeatElement(0, count: id - counts.count + 1))
+                    sizes.append(contentsOf: repeatElement(0, count: id - sizes.count + 1))
+                }
+                counts[id] += 1
+                sizes[id] += node.size
             }
-
-            for child in node.children {
-                collect(child)
-            }
+            stack.append(contentsOf: node.children)
         }
 
-        collect(root)
+        var stats: [String: (count: Int, size: UInt64)] = [:]
+        for id in counts.indices where counts[id] > 0 {
+            stats[registry.kindName(for: UInt16(id))] = (count: counts[id], size: sizes[id])
+        }
         return stats
     }
 
-    private func addVolumeSpaceItems(for url: URL) async {
-        guard let root = rootNode else { return }
-
+    private func addVolumeSpaceItems(to root: FileNode, for url: URL) {
         do {
             // Only add volume space items when scanning a volume root
             let resourceValues = try url.resourceValues(forKeys: [
@@ -257,7 +259,9 @@ class AppState: ObservableObject {
             let scannedSize = root.size
             let totalSize = UInt64(totalCapacity)
             let freeSize = UInt64(availableCapacity)
-            let otherSize = totalSize - freeSize - scannedSize
+            // Unsigned: firmlinks and clones can make the scanned size larger than the used space
+            let usedSize = totalSize > freeSize ? totalSize - freeSize : 0
+            let otherSize = usedSize > scannedSize ? usedSize - scannedSize : 0
 
             if showOtherSpace && otherSize > 0 {
                 let otherItem = FileNode(

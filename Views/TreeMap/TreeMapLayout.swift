@@ -28,6 +28,20 @@ enum TreeMapLayout {
         depth: Int = 0,
         maxDepth: Int = 30
     ) -> [TreeMapRect] {
+        var directoryRects: [ObjectIdentifier: CGRect] = [:]
+        return layout(node: node, rect: rect, colorProvider: colorProvider,
+                      depth: depth, maxDepth: maxDepth, directoryRects: &directoryRects)
+    }
+
+    /// Calculates treemap layout, and also records the rect of each directory that is subdivided
+    static func layout(
+        node: FileNode,
+        rect: CGRect,
+        colorProvider: (String) -> Color,
+        depth: Int = 0,
+        maxDepth: Int = 30,
+        directoryRects: inout [ObjectIdentifier: CGRect]
+    ) -> [TreeMapRect] {
         var results: [TreeMapRect] = []
 
         // Filter zero-size children; assume already sorted by size (scanner does this)
@@ -48,6 +62,7 @@ enum TreeMapLayout {
         let totalWeight = Double(node.size)
 
         guard totalWeight > 0 else { return results }
+        directoryRects[ObjectIdentifier(node)] = rect
 
         // Determine if rows should be horizontal or vertical
         let horizontal = rect.width >= rect.height
@@ -127,7 +142,8 @@ enum TreeMapLayout {
                             rect: childRect,
                             colorProvider: colorProvider,
                             depth: depth + 1,
-                            maxDepth: maxDepth
+                            maxDepth: maxDepth,
+                            directoryRects: &directoryRects
                         )
                         results.append(contentsOf: childRects)
                     } else {

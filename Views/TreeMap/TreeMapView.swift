@@ -10,56 +10,71 @@ import SwiftUI
 
 struct TreeMapView: View {
     let root: FileNode
+    /// Changes when the tree changes in place (e.g. a file moved to the Trash)
+    var treeVersion: Int = 0
     @Binding var selectedNode: FileNode?
     let colorProvider: (String) -> Color
 
     @State private var hoveredNode: FileNode?
 
-    // Use a class to store layout cache without triggering view updates
-    private class LayoutCache {
-        var rects: [ObjectIdentifier: TreeMapRect] = [:]
-        var cachedSize: CGSize = .zero
-        var cachedRootId: ObjectIdentifier?
-        var cachedRectList: [TreeMapRect] = []
+    // Use a class to store layout cache without triggering view updates.
+    // Keep it in @State so it survives when the parent view is rebuilt.
+    final class LayoutCache {
+        private(set) var rects: [TreeMapRect] = []
+        private(set) var leafRects: [ObjectIdentifier: CGRect] = [:]
+        private(set) var directoryRects: [ObjectIdentifier: CGRect] = [:]
+        /// Increases each time the layout is calculated again
+        private(set) var version = 0
+
+        private var cachedSize: CGSize = .zero
+        private var cachedRootId: ObjectIdentifier?
+        private var cachedTreeVersion = -1
+
+        func update(root: FileNode, size: CGSize, treeVersion: Int, colorProvider: (String) -> Color) {
+            let rootId = ObjectIdentifier(root)
+            guard size != cachedSize || rootId != cachedRootId || treeVersion != cachedTreeVersion else { return }
+
+            var directories: [ObjectIdentifier: CGRect] = [:]
+            rects = TreeMapLayout.layout(
+                node: root,
+                rect: CGRect(origin: .zero, size: size),
+                colorProvider: colorProvider,
+                directoryRects: &directories
+            )
+            directoryRects = directories
+            leafRects = Dictionary(rects.map { (ObjectIdentifier($0.node), $0.rect) }, uniquingKeysWith: { first, _ in first })
+
+            cachedSize = size
+            cachedRootId = rootId
+            cachedTreeVersion = treeVersion
+            version += 1
+        }
+
+        /// Rect of a file, or of a directory and all its contents
+        func rect(for node: FileNode) -> CGRect? {
+            let id = ObjectIdentifier(node)
+            return leafRects[id] ?? directoryRects[id]
+        }
     }
-    private let layoutCache = LayoutCache()
+    @State private var layoutCache = LayoutCache()
 
     var body: some View {
         GeometryReader { geometry in
+            let _ = layoutCache.update(root: root, size: geometry.size, treeVersion: treeVersion, colorProvider: colorProvider)
+
             ZStack {
+                // Drawn again only when the layout changes, not on hover or selection
+                TreeMapBaseLayer(rects: layoutCache.rects, layoutVersion: layoutCache.version)
+                    .equatable()
+
+                // Selection and hover: a few strokes on top
                 Canvas { context, size in
-                    // Use cached layout if size and root haven't changed
-                    let rootId = ObjectIdentifier(root)
-                    let rects: [TreeMapRect]
-
-                    if layoutCache.cachedSize == size && layoutCache.cachedRootId == rootId {
-                        rects = layoutCache.cachedRectList
-                    } else {
-                        rects = TreeMapLayout.layout(
-                            node: root,
-                            rect: CGRect(origin: .zero, size: size),
-                            colorProvider: colorProvider
-                        )
-                        // Cache for next draw
-                        layoutCache.cachedSize = size
-                        layoutCache.cachedRootId = rootId
-                        layoutCache.cachedRectList = rects
-                        layoutCache.rects = Dictionary(uniqueKeysWithValues: rects.map { (ObjectIdentifier($0.node), $0) })
+                    // Selection group border (around the entire folder contents)
+                    if let selected = selectedNode, let rect = selectionRect(for: selected, size: size) {
+                        context.stroke(Path(rect.insetBy(dx: 1, dy: 1)), with: .color(.white), lineWidth: 5)
                     }
-
-                    // Draw all rectangles with cushion shading
-                    for rect in rects {
-                        drawCushion(rect, context: context)
-                    }
-
-                    // Draw selection group border (bright red around entire folder contents)
-                    if let selected = selectedNode {
-                        drawSelectionGroupBorder(for: selected, rects: rects, context: context)
-                    }
-
-                    // Draw hover highlight on top
-                    for rect in rects {
-                        drawHoverHighlight(rect, context: context)
+                    if let hovered = hoveredNode, let rect = layoutCache.leafRects[ObjectIdentifier(hovered)] {
+                        context.stroke(Path(rect), with: .color(.white.opacity(0.6)), lineWidth: 1.5)
                     }
                 }
 
@@ -82,11 +97,15 @@ struct TreeMapView: View {
                             }
                     )
                     .onContinuousHover { phase in
+                        let node: FileNode?
                         switch phase {
                         case .active(let location):
-                            hoveredNode = nodeAt(point: location)
+                            node = nodeAt(point: location)
                         case .ended:
-                            hoveredNode = nil
+                            node = nil
+                        }
+                        if node !== hoveredNode {
+                            hoveredNode = node
                         }
                     }
             }
@@ -95,6 +114,67 @@ struct TreeMapView: View {
         .overlay(alignment: .bottom) {
             if let hovered = hoveredNode ?? selectedNode {
                 InfoBar(node: hovered)
+            }
+        }
+    }
+
+    /// Rect of the selection. An ancestor of the zoomed root contains the whole view.
+    private func selectionRect(for selected: FileNode, size: CGSize) -> CGRect? {
+        if let rect = layoutCache.rect(for: selected) {
+            return rect
+        }
+        var current = root.parent
+        while let ancestor = current {
+            if ancestor === selected {
+                return CGRect(origin: .zero, size: size)
+            }
+            current = ancestor.parent
+        }
+        return nil
+    }
+
+    // MARK: - Hit Testing
+
+    /// Walks down the tree through the directory rects that contain the point
+    private func nodeAt(point: CGPoint) -> FileNode? {
+        if let rect = layoutCache.leafRects[ObjectIdentifier(root)] {
+            return rect.contains(point) ? root : nil
+        }
+
+        var node = root
+        descend: while true {
+            for child in node.children where child.size > 0 {
+                let id = ObjectIdentifier(child)
+                if let rect = layoutCache.leafRects[id], rect.contains(point) {
+                    return child
+                }
+                if let rect = layoutCache.directoryRects[id], rect.contains(point) {
+                    node = child
+                    continue descend
+                }
+            }
+            return nil
+        }
+    }
+}
+
+// MARK: - Base Layer
+
+/// Cushions and labels of all rects. Equatable on the layout version,
+/// so SwiftUI skips it when only the hover or the selection changes.
+private struct TreeMapBaseLayer: View, Equatable {
+    let rects: [TreeMapRect]
+    let layoutVersion: Int
+
+    static func == (lhs: TreeMapBaseLayer, rhs: TreeMapBaseLayer) -> Bool {
+        lhs.layoutVersion == rhs.layoutVersion
+    }
+
+    var body: some View {
+        Canvas { context, _ in
+            // Draw all rectangles with cushion shading
+            for rect in rects {
+                drawCushion(rect, context: context)
             }
         }
     }
@@ -130,53 +210,6 @@ struct TreeMapView: View {
         if rect.width > 30 && rect.height > 16 {
             drawLabel(treeRect.node.name, in: rect, context: context)
         }
-    }
-
-    private func drawSelectionGroupBorder(for selected: FileNode, rects: [TreeMapRect], context: GraphicsContext) {
-        // Find bounding box of selected node and all its descendants
-        var minX = CGFloat.infinity
-        var minY = CGFloat.infinity
-        var maxX = -CGFloat.infinity
-        var maxY = -CGFloat.infinity
-        var foundAny = false
-
-        for treeRect in rects {
-            if treeRect.node === selected || isDescendant(treeRect.node, of: selected) {
-                minX = min(minX, treeRect.rect.minX)
-                minY = min(minY, treeRect.rect.minY)
-                maxX = max(maxX, treeRect.rect.maxX)
-                maxY = max(maxY, treeRect.rect.maxY)
-                foundAny = true
-            }
-        }
-
-        guard foundAny else { return }
-
-        let boundingRect = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
-        let borderPath = Path(boundingRect.insetBy(dx: 1, dy: 1))
-
-        // White border
-        context.stroke(borderPath, with: .color(.white), lineWidth: 5)
-    }
-
-    private func isDescendant(_ node: FileNode, of ancestor: FileNode) -> Bool {
-        var current = node.parent
-        while let parent = current {
-            if parent === ancestor {
-                return true
-            }
-            current = parent.parent
-        }
-        return false
-    }
-
-    private func drawHoverHighlight(_ treeRect: TreeMapRect, context: GraphicsContext) {
-        let rect = treeRect.rect
-        guard treeRect.node === hoveredNode else { return }
-
-        let highlightPath = Path(rect)
-
-        context.stroke(highlightPath, with: .color(.white.opacity(0.6)), lineWidth: 1.5)
     }
 
     private func drawLabel(_ text: String, in rect: CGRect, context: GraphicsContext) {
@@ -282,23 +315,6 @@ struct TreeMapView: View {
         let result = (bright, dark)
         Self.colorCache[key] = result
         return result
-    }
-
-    // MARK: - Hit Testing
-
-    private func nodeAt(point: CGPoint) -> FileNode? {
-        // Find the smallest (deepest) rect containing the point
-        var bestMatch: TreeMapRect?
-
-        for (_, rect) in layoutCache.rects {
-            if rect.rect.contains(point) {
-                if bestMatch == nil || rect.depth > bestMatch!.depth {
-                    bestMatch = rect
-                }
-            }
-        }
-
-        return bestMatch?.node
     }
 }
 

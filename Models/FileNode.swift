@@ -57,6 +57,16 @@ class FileNode: Identifiable {
         }
     }
 
+    /// Initializer for regular files whose kindId is already known (used by the scanner)
+    init(path: String, isDirectory: Bool, isPackage: Bool, size: UInt64, kindId: UInt16) {
+        self.path = path
+        self.isDirectory = isDirectory
+        self.isPackage = isPackage
+        self.size = size
+        self.type = .regular
+        self.kindId = kindId
+    }
+
     /// Convenience initializer from URL (extracts path)
     convenience init(url: URL, name: String? = nil, isDirectory: Bool = false, isPackage: Bool = false,
                      size: UInt64 = 0, type: FileNodeType = .regular) {

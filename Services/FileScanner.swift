@@ -3,52 +3,63 @@
 //  DiskInventoryY
 //
 //  Async file system scanner with parallel directory traversal
+//  Reads each directory with getattrlistbulk(2): one system call returns
+//  names, types and sizes for many entries, with no URL objects
 //
 
 import Foundation
+import Darwin
 import UniformTypeIdentifiers
+import os
 
-// MARK: - Array Chunking Extension
+/// Shared scan state: options, counters and progress throttling
+private final class ScanContext: @unchecked Sendable {
+    let showPackageContents: Bool
+    let usePhysicalSize: Bool
+    let maxConcurrentDirectories: Int
+    private let progress: @Sendable (String, Int, Int) -> Void
 
-private extension Array {
-    func chunked(into size: Int) -> [[Element]] {
-        stride(from: 0, to: count, by: size).map {
-            Array(self[$0..<Swift.min($0 + size, count)])
+    private struct Counts {
+        var files = 0
+        var folders = 0
+        var lastReport: UInt64 = 0
+    }
+    private let counts = OSAllocatedUnfairLock(initialState: Counts())
+
+    /// Minimum time between two progress reports (100 ms)
+    private static let reportInterval: UInt64 = 100_000_000
+
+    init(showPackageContents: Bool, usePhysicalSize: Bool, parallel: Bool,
+         progress: @escaping @Sendable (String, Int, Int) -> Void) {
+        self.showPackageContents = showPackageContents
+        self.usePhysicalSize = usePhysicalSize
+        self.maxConcurrentDirectories = parallel ? max(4, ProcessInfo.processInfo.activeProcessorCount) : 1
+        self.progress = progress
+    }
+
+    /// Adds the counts of one directory, and reports progress at most every 100 ms
+    func add(files: Int, folders: Int, currentFolder: @autoclosure () -> String) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let report: (Int, Int)? = counts.withLock { c in
+            c.files += files
+            c.folders += folders
+            guard now &- c.lastReport >= Self.reportInterval else { return nil }
+            c.lastReport = now
+            return (c.files, c.folders)
+        }
+        if let (files, folders) = report {
+            progress(currentFolder(), files, folders)
         }
     }
 }
 
-/// Thread-safe counter for progress reporting
-private final class ProgressCounter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var _fileCount = 0
-    private var _folderCount = 0
-
-    var fileCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return _fileCount
-    }
-
-    var folderCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return _folderCount
-    }
-
-    func incrementFiles() -> (Int, Int) {
-        lock.lock()
-        defer { lock.unlock() }
-        _fileCount += 1
-        return (_fileCount, _folderCount)
-    }
-
-    func incrementFolders() -> (Int, Int) {
-        lock.lock()
-        defer { lock.unlock() }
-        _folderCount += 1
-        return (_fileCount, _folderCount)
-    }
+/// One entry returned by getattrlistbulk
+private struct DirectoryEntry {
+    let name: String
+    let isDirectory: Bool
+    let hasBundleBit: Bool
+    let logicalSize: UInt64
+    let allocatedSize: UInt64
 }
 
 actor FileScanner {
@@ -67,256 +78,253 @@ actor FileScanner {
         useParallelScanning: Bool = true,
         progress: @escaping @Sendable (String, Int, Int) -> Void
     ) async throws -> FileNode {
-        let counter = ProgressCounter()
+        let context = ScanContext(
+            showPackageContents: showPackageContents,
+            usePhysicalSize: usePhysicalSize,
+            parallel: useParallelScanning,
+            progress: progress
+        )
 
         let task = Task {
-            if useParallelScanning {
-                return try await Self.scanDirectoryParallel(
-                    url: url,
-                    parent: nil,
-                    showPackageContents: showPackageContents,
-                    usePhysicalSize: usePhysicalSize,
-                    counter: counter,
-                    progress: progress
-                )
-            } else {
-                return try await Self.scanDirectorySequential(
-                    url: url,
-                    parent: nil,
-                    showPackageContents: showPackageContents,
-                    usePhysicalSize: usePhysicalSize,
-                    counter: counter,
-                    progress: progress
-                )
-            }
+            try await Self.scanRoot(url: url, context: context)
         }
         scanTask = task
 
-        let result = try await task.value
-        result.sortChildrenBySize()
-        return result
+        // Children are sorted by size as each directory finishes
+        return try await task.value
     }
 
     // MARK: - Private Implementation (static for parallel execution)
 
-    private static let resourceKeys: Set<URLResourceKey> = [
-        .nameKey,
+    private static let rootResourceKeys: Set<URLResourceKey> = [
         .isDirectoryKey,
         .isPackageKey,
         .fileSizeKey,
         .totalFileAllocatedSizeKey,
-        .contentTypeKey,
         .isSymbolicLinkKey,
         .isAliasFileKey
     ]
 
-    /// Creates a FileNode from a URL, reporting progress
-    private static func makeNode(
-        url: URL,
-        parent: FileNode?,
-        usePhysicalSize: Bool,
-        counter: ProgressCounter,
-        progress: @escaping @Sendable (String, Int, Int) -> Void
-    ) throws -> (node: FileNode, isDirectory: Bool, isPackage: Bool, shouldDescend: Bool) {
-        let values = try url.resourceValues(forKeys: resourceKeys)
+    private static func scanRoot(url: URL, context: ScanContext) async throws -> FileNode {
+        try Task.checkCancellation()
 
+        let values = try url.resourceValues(forKeys: rootResourceKeys)
         let isDirectory = values.isDirectory ?? false
         let isPackage = values.isPackage ?? false
-        let isSymlink = values.isSymbolicLink ?? false
-        let isAlias = values.isAliasFile ?? false
+        let size = context.usePhysicalSize
+            ? UInt64(values.totalFileAllocatedSize ?? values.fileSize ?? 0)
+            : UInt64(values.fileSize ?? 0)
 
-        let size: UInt64
-        if usePhysicalSize {
-            size = UInt64(values.totalFileAllocatedSize ?? values.fileSize ?? 0)
-        } else {
-            size = UInt64(values.fileSize ?? 0)
-        }
-
-        // Use path directly - more memory efficient than storing URL
         let node = FileNode(
             path: url.path,
             isDirectory: isDirectory,
             isPackage: isPackage,
             size: isDirectory ? 0 : size
         )
-        node.parent = parent
-
-        // Report progress
-        if isDirectory {
-            let (files, folders) = counter.incrementFolders()
-            progress(url.lastPathComponent, files, folders)
-        } else {
-            _ = counter.incrementFiles()
-        }
+        context.add(files: isDirectory ? 0 : 1, folders: isDirectory ? 1 : 0, currentFolder: node.name)
 
         // Don't follow symlinks or aliases to avoid infinite loops
-        let shouldDescend = isDirectory && !isSymlink && !isAlias
-
-        return (node, isDirectory, isPackage, shouldDescend)
+        let shouldDescend = isDirectory && !(values.isSymbolicLink ?? false) && !(values.isAliasFile ?? false)
+        if shouldDescend && (context.showPackageContents || !isPackage) {
+            try await scanContents(of: node, context: context)
+        }
+        return node
     }
 
-    // MARK: - Parallel Scanning (with batched concurrency)
-
-    /// Number of directories to process in parallel per batch
-    private static let batchSize = 8
-
-    private static func scanDirectoryParallel(
-        url: URL,
-        parent: FileNode?,
-        showPackageContents: Bool,
-        usePhysicalSize: Bool,
-        counter: ProgressCounter,
-        progress: @escaping @Sendable (String, Int, Int) -> Void
-    ) async throws -> FileNode {
+    /// Fills `node.children` and `node.size`, then sorts the children by size
+    private static func scanContents(of node: FileNode, context: ScanContext) async throws {
         try Task.checkCancellation()
 
-        let (node, _, isPackage, shouldDescend) = try makeNode(
-            url: url,
-            parent: parent,
-            usePhysicalSize: usePhysicalSize,
-            counter: counter,
-            progress: progress
-        )
+        let entries = readDirectory(atPath: node.path) ?? []
+        let parentPath = node.path == "/" ? "" : node.path
 
-        guard shouldDescend && (showPackageContents || !isPackage) else {
-            return node
-        }
+        var children: [FileNode] = []
+        children.reserveCapacity(entries.count)
+        var subdirectories: [FileNode] = []
+        var size: UInt64 = 0
+        var fileCount = 0
+        var kindCache: [String: UInt16] = [:]
 
-        do {
-            let contents = try FileManager.default.contentsOfDirectory(
-                at: url,
-                includingPropertiesForKeys: Array(resourceKeys),
-                options: []
-            )
-
-            // Separate directories from files for smarter processing
-            // Note: resourceValues are already cached from contentsOfDirectory call
-            var directories: [URL] = []
-
-            for childURL in contents {
-                // Use cached resource values from contentsOfDirectory prefetch
-                let isDir = (try? childURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-                if isDir {
-                    directories.append(childURL)
+        for entry in entries {
+            let path = parentPath + "/" + entry.name
+            if entry.isDirectory {
+                let isPackage = isPackageDirectory(path: path, name: entry.name, hasBundleBit: entry.hasBundleBit)
+                let child = FileNode(path: path, isDirectory: true, isPackage: isPackage, size: 0)
+                child.parent = node
+                children.append(child)
+                if context.showPackageContents || !isPackage {
+                    subdirectories.append(child)
+                }
+            } else {
+                let fileSize = context.usePhysicalSize ? entry.allocatedSize : entry.logicalSize
+                let ext = (entry.name as NSString).pathExtension
+                let kindId: UInt16
+                if let cached = kindCache[ext] {
+                    kindId = cached
                 } else {
-                    // Process files immediately - no task overhead
-                    try Task.checkCancellation()
-                    do {
-                        let (fileNode, _, _, _) = try makeNode(
-                            url: childURL,
-                            parent: node,
-                            usePhysicalSize: usePhysicalSize,
-                            counter: counter,
-                            progress: progress
-                        )
-                        node.children.append(fileNode)
-                        node.size += fileNode.size
-                    } catch {
-                        // Skip inaccessible files
-                    }
+                    kindId = FileKindRegistry.shared.kindId(forExtension: ext)
+                    kindCache[ext] = kindId
                 }
+                let child = FileNode(path: path, isDirectory: false, isPackage: false, size: fileSize, kindId: kindId)
+                child.parent = node
+                children.append(child)
+                size += fileSize
+                fileCount += 1
             }
-
-            // Process directories in batches to limit memory usage
-            for batch in directories.chunked(into: batchSize) {
-                try Task.checkCancellation()
-
-                try await withThrowingTaskGroup(of: FileNode?.self) { group in
-                    for dirURL in batch {
-                        group.addTask {
-                            try Task.checkCancellation()
-                            do {
-                                return try await scanDirectoryParallel(
-                                    url: dirURL,
-                                    parent: node,
-                                    showPackageContents: showPackageContents,
-                                    usePhysicalSize: usePhysicalSize,
-                                    counter: counter,
-                                    progress: progress
-                                )
-                            } catch is CancellationError {
-                                throw CancellationError()
-                            } catch {
-                                return nil
-                            }
-                        }
-                    }
-
-                    for try await childNode in group {
-                        if let child = childNode {
-                            node.children.append(child)
-                            node.size += child.size
-                        }
-                    }
-                }
-            }
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            // Can't enumerate directory, return node with no children
         }
 
-        return node
+        node.children = children
+        context.add(files: fileCount, folders: children.count - fileCount, currentFolder: node.name)
+
+        // Scan subdirectories with a sliding window: a new one starts as soon as one finishes
+        if !subdirectories.isEmpty {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                var pending = subdirectories.makeIterator()
+                for _ in 0..<context.maxConcurrentDirectories {
+                    guard let dir = pending.next() else { break }
+                    group.addTask { try await scanContents(of: dir, context: context) }
+                }
+                while try await group.next() != nil {
+                    if let dir = pending.next() {
+                        group.addTask { try await scanContents(of: dir, context: context) }
+                    }
+                }
+            }
+        }
+
+        for child in children where child.isDirectory {
+            size += child.size
+        }
+        node.size = size
+        node.children.sort { $0.size > $1.size }
     }
 
-    // MARK: - Sequential Scanning
-
-    private static func scanDirectorySequential(
-        url: URL,
-        parent: FileNode?,
-        showPackageContents: Bool,
-        usePhysicalSize: Bool,
-        counter: ProgressCounter,
-        progress: @escaping @Sendable (String, Int, Int) -> Void
-    ) async throws -> FileNode {
-        try Task.checkCancellation()
-
-        let (node, _, isPackage, shouldDescend) = try makeNode(
-            url: url,
-            parent: parent,
-            usePhysicalSize: usePhysicalSize,
-            counter: counter,
-            progress: progress
-        )
-
-        guard shouldDescend && (showPackageContents || !isPackage) else {
-            return node
+    /// The package rules of macOS are complex: apps declare package types in
+    /// LaunchServices (e.g. .tblk), and app containers named "com.apple.iWork.Numbers"
+    /// are not packages. So ask the system, which is slow, only when necessary.
+    private static func isPackageDirectory(path: String, name: String, hasBundleBit: Bool) -> Bool {
+        let ext = (name as NSString).pathExtension
+        guard hasBundleBit || !ext.isEmpty else { return false }
+        if !hasBundleBit && NonPackageExtensions.contains(ext) {
+            return false
         }
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        let isPackage = (try? url.resourceValues(forKeys: [.isPackageKey]).isPackage) ?? false
+        if !isPackage && !hasBundleBit {
+            NonPackageExtensions.record(ext)
+        }
+        return isPackage
+    }
 
-        do {
-            let contents = try FileManager.default.contentsOfDirectory(
-                at: url,
-                includingPropertiesForKeys: Array(resourceKeys),
-                options: []
-            )
+    // MARK: - getattrlistbulk
 
-            // Scan children sequentially
-            for childURL in contents {
-                try Task.checkCancellation()
-                do {
-                    let child = try await scanDirectorySequential(
-                        url: childURL,
-                        parent: node,
-                        showPackageContents: showPackageContents,
-                        usePhysicalSize: usePhysicalSize,
-                        counter: counter,
-                        progress: progress
-                    )
-                    node.children.append(child)
-                    node.size += child.size
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    // Skip files we can't access (permission denied, etc.)
-                    continue
-                }
+    private static let readBufferSize = 256 * 1024
+
+    /// Reads all entries of a directory. Returns nil if the directory cannot be opened.
+    /// Entries that report an error are skipped.
+    private static func readDirectory(atPath path: String) -> [DirectoryEntry]? {
+        // O_NOFOLLOW: a directory replaced by a symlink after the listing is not followed
+        let fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+
+        var request = attrlist()
+        request.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
+        request.commonattr = attrgroup_t(ATTR_CMN_RETURNED_ATTRS) | attrgroup_t(ATTR_CMN_NAME)
+            | attrgroup_t(ATTR_CMN_ERROR) | attrgroup_t(ATTR_CMN_OBJTYPE) | attrgroup_t(ATTR_CMN_FNDRINFO)
+        request.fileattr = attrgroup_t(ATTR_FILE_ALLOCSIZE) | attrgroup_t(ATTR_FILE_DATALENGTH)
+
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: readBufferSize, alignment: 8)
+        defer { buffer.deallocate() }
+
+        var entries: [DirectoryEntry] = []
+
+        while true {
+            let count = getattrlistbulk(fd, &request, buffer, readBufferSize, 0)
+            if count < 0 {
+                if errno == EINTR { continue }
+                // Read error: show the directory as unreadable, not as complete but too small
+                return nil
             }
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            // Can't enumerate directory, return node with no children
+            if count == 0 { break }
+
+            var entryStart = UnsafeRawPointer(buffer)
+            for _ in 0..<count {
+                let entryLength = Int(entryStart.loadUnaligned(as: UInt32.self))
+                defer { entryStart += entryLength }
+
+                var field = entryStart + MemoryLayout<UInt32>.size
+                let returned = field.loadUnaligned(as: attribute_set_t.self)
+                field += MemoryLayout<attribute_set_t>.size
+
+                // ATTR_CMN_ERROR comes first, before the other common attributes
+                if returned.commonattr & attrgroup_t(ATTR_CMN_ERROR) != 0 {
+                    let error = field.loadUnaligned(as: UInt32.self)
+                    field += MemoryLayout<UInt32>.size
+                    if error != 0 { continue }
+                }
+
+                guard returned.commonattr & attrgroup_t(ATTR_CMN_NAME) != 0 else { continue }
+                let nameRef = field.loadUnaligned(as: attrreference_t.self)
+                let namePointer = (field + Int(nameRef.attr_dataoffset)).assumingMemoryBound(to: CChar.self)
+                let name = String(cString: namePointer)
+                field += MemoryLayout<attrreference_t>.size
+
+                var objectType = fsobj_type_t(VNON.rawValue)
+                if returned.commonattr & attrgroup_t(ATTR_CMN_OBJTYPE) != 0 {
+                    objectType = field.loadUnaligned(as: fsobj_type_t.self)
+                    field += MemoryLayout<fsobj_type_t>.size
+                }
+                let isDirectory = objectType == fsobj_type_t(VDIR.rawValue)
+
+                // Finder flags are big-endian, at byte 8 of FileInfo and FolderInfo
+                var hasBundleBit = false
+                if returned.commonattr & attrgroup_t(ATTR_CMN_FNDRINFO) != 0 {
+                    let finderFlags = UInt16(bigEndian: field.loadUnaligned(fromByteOffset: 8, as: UInt16.self))
+                    hasBundleBit = finderFlags & 0x2000 != 0  // kHasBundle
+                    field += 32
+                }
+
+                var allocatedSize: UInt64 = 0
+                var logicalSize: UInt64 = 0
+                if returned.fileattr & attrgroup_t(ATTR_FILE_ALLOCSIZE) != 0 {
+                    allocatedSize = UInt64(max(0, field.loadUnaligned(as: off_t.self)))
+                    field += MemoryLayout<off_t>.size
+                }
+                if returned.fileattr & attrgroup_t(ATTR_FILE_DATALENGTH) != 0 {
+                    logicalSize = UInt64(max(0, field.loadUnaligned(as: off_t.self)))
+                    field += MemoryLayout<off_t>.size
+                }
+
+                entries.append(DirectoryEntry(
+                    name: name,
+                    isDirectory: isDirectory,
+                    hasBundleBit: hasBundleBit,
+                    logicalSize: logicalSize,
+                    allocatedSize: allocatedSize
+                ))
+            }
         }
 
-        return node
+        return entries
+    }
+}
+
+/// Extensions that are never packages, learned from the answers of the system
+private enum NonPackageExtensions {
+    private static let known = OSAllocatedUnfairLock(initialState: Set<String>())
+
+    static func contains(_ ext: String) -> Bool {
+        known.withLock { $0.contains(ext) }
+    }
+
+    /// Records a "not a package" answer, unless it can depend on the location:
+    /// a declared package type that the system rejected (e.g. an app container)
+    static func record(_ ext: String) {
+        if let type = UTType(filenameExtension: ext, conformingTo: .directory), !type.isDynamic,
+           type.conforms(to: .package) {
+            return
+        }
+        _ = known.withLock { $0.insert(ext) }
     }
 }
